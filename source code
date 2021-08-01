@@ -1,0 +1,282 @@
+require(MASS)
+require(splines)
+require(Hmisc)
+require(spatstat)
+
+#Function implementing Simpson's rule
+simpson <- function(ROC, set.p){
+  l.set.p <- length(set.p)
+  integral <- (set.p[l.set.p] - set.p[1])/(l.set.p - 1)/3*(ROC[1] + ROC[l.set.p] + 4*sum(ROC[seq(2,l.set.p - 1, by = 2)]) + 2*sum(ROC[seq(3, l.set.p - 2, by = 2)]))
+}
+
+#Psi (influence) function
+PsiM <- function(x){
+  Psi <- ifelse(abs(x)<=1.345,x,1.345*sign(x)); return(Psi)
+}
+
+#Derivative of the psi (influence) function
+dPsiM <- function(x){
+  dPsi <- ifelse(abs(x)<=1.345,1,0); return(dPsi)
+}
+
+#Robust AIC for M regression
+#Code adapted from Tharmaratnam and Claeskens (2013)
+AIC.M <- function(y, X, beta.m, scale.m)
+{
+  n <- length(y)
+  U <- UU <- matrix(ncol = 1, nrow = n)
+  for(i in 1:n){
+    U[i,] <- dPsiM((y[i] - X[i,] %*% beta.m)/scale.m)
+    UU[i,] <- (PsiM((y[i] - X[i,] %*% beta.m)/scale.m))^2
+  }
+  J <- (t(X) %*% diag(as.vector(U)) %*% X * (1/(scale.m^2)))/n
+  inv.J <- solve(J)
+  K <- (t(X) %*% diag(as.vector(UU)) %*% X * (1/(scale.m^2)))/n
+  AIC <- 2*n*(log(scale.m)) + 4* sum(diag(inv.J %*%(K)))
+  return(AIC)
+}
+
+#Flexible and robust ROC function for one continuous covariate
+cROC.robust <- function(yh, Xh,
+                        yd, Xd, 
+                        Xhpred, Xdpred,
+                        vh, vd,
+                        p = seq(0, 1, l = 101),
+                        B = 0){
+  
+  compute.ROC <- function(yh, Xh, yd, Xd, Xhpred, Xdpred,
+                          vh, vd,
+                          p = seq(0, 1, l = 101)){
+    
+    fith <- rlm(yh ~ Xh - 1, method = "M", scale.est = "MAD", maxit = 500)
+    fitd <- rlm(yd ~ Xd - 1, method = "M", scale.est = "MAD", maxit = 500)
+    
+    betah <- as.numeric(fith$coefficients)
+    betad <- as.numeric(fitd$coefficients)
+    
+    sigmah <- fith$s
+    sigmad <- fitd$s
+    
+    residualsh <- fith$residuals/sigmah
+    residualsd <- fitd$residuals/sigmad
+    
+    weightsh <- ifelse(abs(residualsh) <= vh, 1, 0)
+    weightsd <- ifelse(abs(residualsd) <= vd, 1, 0)
+    
+    Fdres <- ewcdf(residualsd, weights = weightsd, normalise = TRUE, adjust = 1)
+    
+    npred <- nrow(Xhpred)
+    np <- length(p)
+    roc <- matrix(0, nrow = np, ncol = npred)
+    auc <- numeric(npred)
+    
+    predh <- Xhpred%*%betah
+    predd <- Xdpred%*%betad
+    
+    for(l in 1:npred){
+      roc[,l] <- suppressWarnings(1 - Fdres((predh[l]-predd[l])/sigmad
+                                            + wtd.quantile(x = residualsh, weights = weightsh,
+                                                           probs = 1 - p)*sigmah/sigmad))
+      auc[l] <- simpson(roc[,l], p)  
+    }
+    res <- list()
+    res$p <- p
+    res$ROC <- roc
+    res$AUC <- auc
+    res$fit <- list(h = fith, d = fitd)
+    res$hubweights <- list(h = weightsh, d = weightsd)
+    res$std_residuals <- list(h = residualsh, d = residualsd)
+    res
+  }
+  
+  res.fit <- compute.ROC(yh = yh, Xh = Xh, yd = yd, Xd = Xd,
+                         Xhpred = Xhpred, Xdpred = Xdpred,
+                         vh = vh, vd = vd, p = p)
+  
+  AIC.h <- AIC.M(y = yh, X = Xh, beta.m = as.numeric(res.fit$fit$h$coefficients),
+                 scale.m = res.fit$fit$h$s)
+  AIC.d <- AIC.M(y = yd, X = Xd, beta.m = as.numeric(res.fit$fit$d$coefficients),
+                 scale.m = res.fit$fit$d$s)
+  
+  croc <- res.fit$ROC
+  cauc <- res.fit$AUC
+  
+  if(B > 0) {
+    
+    nh <- length(yh)
+    nd <- length(yd)
+    npred <- nrow(Xhpred)
+    np <- length(p)
+    crocb <- array(0, c(np, npred, B))
+    caucb <- matrix(0, nrow = npred, ncol = B)
+    
+    for(l in 1:B) {
+      reshb <- sample(res.fit$fit$h$residuals, nh, replace = TRUE)
+      resdb <- sample(res.fit$fit$d$residuals, nd, replace = TRUE)
+      
+      yhb <- res.fit$fit$h$fitted + reshb
+      ydb <- res.fit$fit$d$fitted + resdb
+      
+      resboot <- compute.ROC(yh = yhb, Xh = Xh, yd = ydb, Xd = Xd,
+                             Xhpred = Xhpred, Xdpred = Xdpred,
+                             vh = vh, vd = vd, p = p)
+      crocb[,,l] <- resboot$ROC
+      caucb[,l] <- resboot$AUC
+    }
+  }
+  
+  columns <-switch(as.character(B > 0),"TRUE" = 1:3, "FALSE" = 1)
+  col.names <-c("est","ql", "qh")[columns]
+  cROCres <- list()
+  cROCres$est <- croc
+  cAUCres <- matrix(0, ncol = length(columns), nrow = nrow(Xhpred), dimnames = list(1:nrow(Xhpred), col.names))
+  cAUCres[,1] <- cauc
+  
+  if(B > 0) {
+    cROCres$ql <- apply(crocb, c(1,2), quantile, prob = 0.025)
+    cROCres$qh <- apply(crocb, c(1,2), quantile, prob = 0.975)
+    
+    cAUCres[,2] <- apply(caucb, 1, quantile, prob = 0.025)
+    cAUCres[,3] <- apply(caucb, 1, quantile, prob = 0.975)
+  }
+  
+  res <- list()
+  res$p <- p
+  res$ROC <- cROCres
+  res$AUC <- cAUCres
+  res$AIC <- list(h = AIC.h, d = AIC.d)
+  res$std_residuals <- list(h = res.fit$std_residuals$h, d = res.fit$std_residuals$d)
+  res$fit <- res.fit$fit
+  res
+}
+
+
+#Flexible and robust ROC function for one continuous covariate
+cROC.robust.2ccov <- function(yh, Xh1, Xh2, 
+                              yd, Xd1, Xd2, 
+                              Xh1pred, Xh2pred,
+                              Xd1pred, Xd2pred,
+                              vh, vd,
+                              p = seq(0, 1, l = 101),
+                              B = 0){
+  
+  compute.ROC <- function(yh, Xh1, Xh2, 
+                          yd, Xd1, Xd2, 
+                          Xh1pred, Xh2pred,
+                          Xd1pred, Xd2pred, 
+                          vh, vd, p){
+    
+    fith <- rlm(yh ~ Xh1 + Xh2 , method = "M", scale.est = "MAD", maxit = 200)
+    fitd <- rlm(yd ~ Xd1 + Xd2 , method = "M", scale.est = "MAD", maxit = 200)
+    
+    betah <- as.numeric(fith$coefficients)
+    betad <- as.numeric(fitd$coefficients)
+    
+    sigmah <- fith$s
+    sigmad <- fitd$s
+    
+    residualsh <- fith$residuals/sigmah
+    residualsd <- fitd$residuals/sigmad
+    
+    weightsh <- ifelse(abs(residualsh) <= vh, 1, 0)
+    weightsd <- ifelse(abs(residualsd) <= vd, 1, 0)
+    
+    Fdres <- ewcdf(residualsd, weights = weightsd, normalise = TRUE, adjust = 1)
+    
+    n1pred <- nrow(Xh1pred)
+    n2pred <- nrow(Xh2pred)
+    np <- length(p)
+    roc <- array(0, c(np, n1pred, n2pred))
+    auc <- matrix(0, nrow = n1pred, ncol = n2pred)
+    
+    for(j in 1:n1pred){
+      for(l in 1:n2pred){
+        Xhpred <- c(1, Xh1pred[j, ], Xh2pred[l, ]) 
+        predh <- Xhpred%*%betah
+        
+        Xdpred <- c(1, Xd1pred[j, ], Xd2pred[l, ]) 
+        predd <- Xdpred%*%betad
+        
+        roc[, j, l] <- suppressWarnings(1 - Fdres((predh-predd)/sigmad
+                                                  + wtd.quantile(x = residualsh, weights = weightsh,
+                                                                 probs = 1 - p)*sigmah/sigmad)) 
+        auc[j, l] <- simpson(roc[, j, l] , p)  
+      }
+    }
+    
+    res <- list()
+    res$p <- p
+    res$ROC <- roc
+    res$AUC <- auc
+    res$fit <- list(h = fith, d = fitd)
+    res$hubweights <- list(h = weightsh, d = weightsd)
+    res
+  }
+  
+  res.fit <- compute.ROC(yh = yh, Xh1 = Xh1, Xh2 = Xh2,
+                         yd = yd, Xd1 = Xd1, Xd2 = Xd2,
+                         Xh1pred = Xh1pred, Xh2pred = Xh2pred, 
+                         Xd1pred = Xd1pred, Xd2pred = Xd2pred,
+                         vh = vh, vd = vd, p = p)
+  
+  AIC.h <- AIC.M(y = yh, X = cbind(rep(1,length(yh)), Xh1, Xh2), beta.m = as.numeric(res.fit$fit$h$coefficients),
+                 scale.m = res.fit$fit$h$s)
+  AIC.d <- AIC.M(y = yd, X = cbind(rep(1,length(yd)), Xd1, Xd2), beta.m = as.numeric(res.fit$fit$d$coefficients),
+                 scale.m = res.fit$fit$d$s)
+  
+  croc <- res.fit$ROC
+  cauc <- res.fit$AUC
+  
+  if(B > 0) {
+    
+    nh <- length(yh)
+    nd <- length(yd)
+    n1pred <- nrow(Xh1pred)
+    n2pred <- nrow(Xh2pred)
+    np <- length(p)
+    crocb <- array(0, c(np, n1pred, n2pred, B))
+    caucb <- array(0, c(n1pred, n2pred, B))
+    
+    for(l in 1:B) {
+      reshb <- sample(res.fit$fit$h$residuals, nh, replace = TRUE)
+      resdb <- sample(res.fit$fit$d$residuals, nd, replace = TRUE)
+      
+      yhb <- res.fit$fit$h$fitted + reshb
+      ydb <- res.fit$fit$d$fitted + resdb
+      
+      resboot <- compute.ROC(yh = yhb, Xh1 = Xh1, Xh2 = Xh2, 
+                             yd = ydb, Xd1 = Xd1, Xd2 = Xd2,
+                             Xh1pred = Xh1pred, Xh2pred = Xh2pred,
+                             Xd1pred = Xd1pred, Xd2pred = Xd2pred,
+                             vh = vh, vd = vd, p = p)
+      crocb[,,,l] <- resboot$ROC
+      caucb[,,l] <- resboot$AUC
+    }
+  }
+  
+  if(B>0){
+    cROCres <- array(0, c(np, n1pred, n2pred, 3))
+    cROCres[,,,1] <- croc
+    cROCres[,,,2] <- apply(crocb, c(1,2,3), quantile, prob = 0.025)
+    cROCres[,,,3] <- apply(crocb, c(1,2,3), quantile, prob = 0.975)
+    
+    cAUCres <- array(0, c(n1pred, n2pred, 3))
+    cAUCres[, , 1] <- cauc
+    cAUCres[, , 2] <- apply(caucb, c(1,2), quantile, prob = 0.025)
+    cAUCres[, , 3] <- apply(caucb, c(1,2), quantile, prob = 0.975)
+  } 
+  else{
+    cROCres <- croc
+    cAUCres <- cauc
+  }
+  
+  res <- list()
+  res$p <- p
+  res$ROC <- cROCres
+  res$AUC <- cAUCres
+  res$AIC <- list(h = AIC.h, d = AIC.d)
+  res$fit <- res.fit$fit
+  res
+}
+
+
